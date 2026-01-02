@@ -1,0 +1,1135 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+    <title>说话者情绪分析（单文件，移动友好）</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+            margin: 12px;
+            background: #fff;
+            color: #111
+        }
+
+        h1 {
+            font-size: 18px;
+            margin: 6px 0
+        }
+
+        #controls {
+            margin: 8px 0
+        }
+
+        button {
+            margin-right: 8px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid #ccc;
+            background: #f7f7f7
+        }
+
+        #micIndicator {
+            display: inline-block;
+            margin-left: 6px
+        }
+
+        #wave {
+            width: 100%;
+            height: 80px;
+            background: #111;
+            border-radius: 6px;
+            margin-top: 8px
+        }
+
+        #status {
+            margin-top: 8px
+        }
+
+        .card {
+            margin-top: 12px;
+            padding: 10px;
+            border-radius: 8px;
+            background: #fafafa;
+            border: 1px solid #eee
+        }
+
+        #transcript span,
+        #emotion span {
+            word-break: break-word
+        }
+
+        .positive {
+            background: #d4f7dc;
+            color: #084018;
+            padding: 6px;
+            border-radius: 6px
+        }
+
+        .negative {
+            background: #ffdede;
+            color: #621010;
+            padding: 6px;
+            border-radius: 6px
+        }
+
+        .neutral {
+            background: #eef3ff;
+            color: #10204a;
+            padding: 6px;
+            border-radius: 6px
+        }
+
+        textarea {
+            width: 100%;
+            height: 80px;
+            border-radius: 6px;
+            padding: 8px
+        }
+    </style>
+</head>
+
+<body>
+    <h1>说话者情绪分析（单文件）</h1>
+
+    <div id="controls">
+        <button id="btnStart">开启麦克风</button>
+        <button id="btnStop" disabled>停止</button>
+        <button id="btnSettings">设置</button>
+        <button id="btnTestProxy">测试代理</button>
+        <span id="micIndicator">麦克风: 未连接</span>
+    </div>
+
+    <canvas id="wave"></canvas>
+
+    <div id="status" class="card">状态：等待</div>
+
+    <div id="transcript" class="card"><strong>识别文本：</strong>
+        <div><span id="txt">（尚无）</span></div>
+    </div>
+
+    <div id="emotion" class="card"><strong>情绪判断：</strong>
+        <div><span id="emo">（尚无）</span></div>
+    </div>
+
+    <div id="audio-analysis" class="card"><strong>声学情绪（基于语调/节奏）：</strong>
+        <div id="audio-metrics">RMS:- ⸱ Pitch:- ⸱ Voiced:-</div>
+        <div style="margin-top:6px"><span id="audio-emo">（尚无）</span></div>
+    </div>
+
+    <div class="card">
+        <strong>如果浏览器不支持语音识别：</strong>
+        <div>可手动输入文本并点击“分析”：</div>
+        <textarea id="manualText" placeholder="在此粘贴或输入文本进行情绪分析"></textarea>
+        <div style="margin-top:8px"><button id="btnAnalyze">分析</button></div>
+    </div>
+
+    <div class="card">
+        <strong>配置（在顶部脚本内修改）</strong>
+        <ul>
+            <li>apiType: 'local'（仅关键词本地分析） / 'proxy'（调用本地后端代理） / 'baidu'（前端直连，不推荐）</li>
+            <li>proxyUrl: 当使用 'proxy' 时可设置为完整地址，例如：http://手机可访问的IP:3000/api/sentiment</li>
+        </ul>
+    </div>
+
+    <script>
+        // ===== 配置（可通过设置对话框修改） =====
+        const DEFAULT_CONFIG = {
+            // 'local' | 'proxy' | 'baidu' | 'llm'（大模型辅助）
+            apiType: 'local',
+            // 当 apiType==='proxy' 时设置为可从手机访问的代理地址
+            proxyUrl: '/api/sentiment',
+            baiduApiKey: '',
+            baiduSecretKey: '',
+            // 大模型配置
+            llmType: 'openai', // 'openai' | 'gemini' | 'claude' | 'custom'
+            llmApiKey: '',
+            llmApiUrl: '', // 自定义大模型API地址
+            llmModel: 'gpt-3.5-turbo' // 大模型型号
+        };
+        let CONFIG = Object.assign({}, DEFAULT_CONFIG);
+
+        function loadConfig() {
+            try {
+                const raw = localStorage.getItem('emotion_config_v1');
+                if (raw) { CONFIG = Object.assign({}, DEFAULT_CONFIG, JSON.parse(raw)); }
+            } catch (e) { console.warn('loadConfig error', e); CONFIG = Object.assign({}, DEFAULT_CONFIG); }
+        }
+        function saveConfig() {
+            try { localStorage.setItem('emotion_config_v1', JSON.stringify(CONFIG)); }
+            catch (e) { console.warn('saveConfig error', e); }
+        }
+        loadConfig();
+
+        // ===== 元素引用 =====
+        const btnStart = document.getElementById('btnStart');
+        const btnStop = document.getElementById('btnStop');
+        const btnSettings = document.getElementById('btnSettings');
+        const btnTestProxy = document.getElementById('btnTestProxy');
+        const micIndicator = document.getElementById('micIndicator');
+        const statusEl = document.getElementById('status');
+        const canvas = document.getElementById('wave');
+        const txtEl = document.getElementById('txt');
+        const emoEl = document.getElementById('emo');
+        const metricsEl = document.getElementById('audio-metrics');
+        const audioEmoEl = document.getElementById('audio-emo');
+        const manualText = document.getElementById('manualText');
+        const btnAnalyze = document.getElementById('btnAnalyze');
+
+        let audioCtx, analyser, source, rafId, mediaStream;
+        let lastResultTime = 0;
+        let lastResultText = '';
+        let featureWindow = [];
+        let voicedTime = 0, silentTime = 0;
+        // 情绪缓冲变量 - 实现情绪变化的累积效应
+        let emotionBuffer = {
+            '激动/愤怒': 0,
+            '高兴/兴奋': 0,
+            '积极/愉悦': 0,
+            '紧张/焦虑': 0,
+            '悲伤/低落': 0,
+            '疲倦/虚弱': 0,
+            '平静/中性': 1 // 初始值为平静
+        };
+        // 缓冲系数 - 控制新情绪对缓冲的影响程度 (0-1)
+        const EMOTION_BUFFER_ALPHA = 0.2;
+
+        function setStatus(s) { statusEl.textContent = '状态：' + s; }
+
+        async function startAudio() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                micIndicator.textContent = '麦克风: 已连接';
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                source = audioCtx.createMediaStreamSource(mediaStream);
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 2048;
+                source.connect(analyser);
+                drawWaveform();
+                startSpeechRecognition();
+                btnStart.disabled = true; btnStop.disabled = false;
+                setStatus('监听中');
+            } catch (e) {
+                console.warn('获取麦克风失败:', e);
+                if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+                    showPermissionGuide();
+                } else {
+                    setStatus('获取麦克风失败：' + e.message);
+                }
+            }
+        }
+
+        function showPermissionGuide() {
+            // 检测设备类型
+            const isAndroid = /Android/i.test(navigator.userAgent);
+            const isiOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+            const userAgent = navigator.userAgent;
+            const isChrome = /Chrome/i.test(userAgent) && /Google Inc/.test(navigator.vendor);
+            const isEdge = /Edg/i.test(userAgent);
+            const isSafari = /Safari/i.test(userAgent) && !isChrome && !isEdge;
+            const isFirefox = /Firefox/i.test(userAgent);
+
+            const modal = document.createElement('div');
+            modal.style.position = 'fixed'; modal.style.left = 0; modal.style.top = 0; modal.style.right = 0; modal.style.bottom = 0;
+            modal.style.background = 'rgba(0,0,0,0.6)'; modal.style.display = 'flex'; modal.style.alignItems = 'center'; modal.style.justifyContent = 'center';
+            modal.style.zIndex = '1000';
+
+            // 根据设备类型生成不同的指引内容
+            let setupSteps;
+            let browserName = '您的浏览器';
+            if (isChrome) browserName = 'Chrome';
+            else if (isEdge) browserName = 'Edge';
+            else if (isSafari) browserName = 'Safari';
+            else if (isFirefox) browserName = 'Firefox';
+
+            if (isAndroid) {
+                setupSteps = `
+        <strong>Android手机设置步骤：</strong><br>
+        1. 打开手机「设置」<br>
+        2. 找到「应用和通知」或「应用管理」<br>
+        3. 找到并选择「${browserName}」浏览器<br>
+        4. 点击「权限」<br>
+        5. 找到「麦克风」并开启权限<br>
+        6. 返回此页面，点击「重试」`;
+            } else if (isiOS) {
+                setupSteps = `
+        <strong>iPhone/iPad设置步骤：</strong><br>
+        1. 打开手机「设置」<br>
+        2. 向下滑动找到并点击「${browserName}」<br>
+        3. 找到「麦克风」选项<br>
+        4. 切换开关至「允许」状态<br>
+        5. 返回此页面，点击「重试」`;
+            } else {
+                setupSteps = `
+        <strong>如何在手机上开启权限：</strong><br>
+        1. 打开手机「设置」<br>
+        2. 找到「应用管理」或类似选项<br>
+        3. 选择「${browserName}」浏览器<br>
+        4. 开启「麦克风」权限<br>
+        5. 返回此页面，点击「重试」`;
+            }
+
+            const box = document.createElement('div'); box.style.background = '#fff'; box.style.padding = '16px'; box.style.borderRadius = '12px'; box.style.width = '92%'; box.style.maxWidth = '400px';
+            box.innerHTML = `
+      <h3 style="margin:0 0 12px 0;text-align:center">需要麦克风权限</h3>
+      <div style="margin-bottom:12px;line-height:1.6">
+        为了使用语音识别功能，需要您授予麦克风权限。
+        <br><br><strong>提示：</strong>您只需要给${browserName}浏览器授予麦克风权限即可，无需给HTML应用单独授权。
+      </div>
+      <div style="margin-bottom:16px;padding:12px;background:#f5f5f5;border-radius:8px;line-height:1.6">
+        ${setupSteps}
+      </div>
+      <div style="text-align:center">
+        <button id="guide_go_settings" style="padding:10px 20px;background:#007aff;color:white;border:none;border-radius:8px;margin-right:8px;margin-bottom:8px">前往设置</button>
+        <button id="guide_retry" style="padding:10px 20px;background:#4CAF50;color:white;border:none;border-radius:8px;margin-right:8px;margin-bottom:8px">重试</button>
+        <button id="guide_close" style="padding:10px 20px;background:#eee;color:#333;border:none;border-radius:8px;margin-bottom:8px">稍后再说</button>
+      </div>
+    `;
+            modal.appendChild(box); document.body.appendChild(modal);
+
+            box.querySelector('#guide_close').addEventListener('click', () => {
+                document.body.removeChild(modal);
+                setStatus('需要麦克风权限才能使用语音识别');
+            });
+
+            // 重试按钮事件
+            box.querySelector('#guide_retry').addEventListener('click', () => {
+                document.body.removeChild(modal);
+                setStatus('正在重新请求麦克风权限...');
+                startAudio(); // 重新请求麦克风权限
+            });
+
+            box.querySelector('#guide_go_settings').addEventListener('click', () => {
+                try {
+                    // 尝试打开系统设置
+                    if (isAndroid) {
+                        let intentUrl;
+                        if (isChrome) {
+                            // Chrome浏览器的精确设置路径
+                            intentUrl = 'intent://settings/applications/com.android.chrome/permissions#Intent;action=android.settings.APPLICATION_DETAILS_SETTINGS;package=com.android.chrome;end';
+                        } else if (isEdge) {
+                            // Edge浏览器的精确设置路径
+                            intentUrl = 'intent://settings/applications/com.microsoft.emmx/permissions#Intent;action=android.settings.APPLICATION_DETAILS_SETTINGS;package=com.microsoft.emmx;end';
+                        } else if (isFirefox) {
+                            // Firefox浏览器的精确设置路径
+                            intentUrl = 'intent://settings/applications/org.mozilla.firefox/permissions#Intent;action=android.settings.APPLICATION_DETAILS_SETTINGS;package=org.mozilla.firefox;end';
+                        } else {
+                            // 通用应用设置
+                            intentUrl = 'intent://settings/applications/#Intent;action=android.settings.MANAGE_ALL_APPLICATIONS_SETTINGS;end';
+                        }
+                        // 先显示提示，然后尝试跳转
+                        alert('正在尝试打开' + browserName + '浏览器的权限设置页面...');
+                        // 使用setTimeout确保alert先显示
+                        setTimeout(() => {
+                            window.location.href = intentUrl;
+                        }, 100);
+                    } else if (isiOS) {
+                        // iOS不支持直接跳转，提供清晰的手动指引
+                        alert('请按照上述步骤手动打开系统设置并为' + browserName + '浏览器启用麦克风权限');
+                    } else {
+                        alert('请按照上述步骤手动打开系统设置并启用麦克风权限');
+                    }
+                } catch (error) {
+                    console.warn('打开设置失败:', error);
+                    alert('请按照上述步骤手动打开系统设置并为' + browserName + '浏览器启用麦克风权限');
+                }
+                document.body.removeChild(modal);
+                setStatus('请在系统设置中为' + browserName + '浏览器开启麦克风权限，然后返回点击"重试"');
+            });
+        }
+
+        function stopAudio() {
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+            if (audioCtx) { audioCtx.close(); audioCtx = null; }
+            cancelAnimationFrame(rafId);
+            micIndicator.textContent = '麦克风: 未连接';
+            btnStart.disabled = false; btnStop.disabled = true;
+            setStatus('已停止');
+            stopSpeechRecognition();
+            // 保留情绪缓冲，不重置，以便下次启动时继续累积
+        }
+
+        function drawWaveform() {
+            if (!analyser) return;
+            const canvasCtx = canvas.getContext('2d');
+            const bufferLength = analyser.fftSize;
+            const dataArray = new Uint8Array(bufferLength);
+            function resize() { canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight; }
+            resize(); window.addEventListener('resize', resize);
+            function draw() {
+                rafId = requestAnimationFrame(draw);
+                analyser.getByteTimeDomainData(dataArray);
+                canvasCtx.fillStyle = '#111'; canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+                canvasCtx.lineWidth = 2; canvasCtx.strokeStyle = '#0f8'; canvasCtx.beginPath();
+                const sliceWidth = canvas.width / bufferLength; let x = 0; let sum = 0;
+                for (let i = 0; i < bufferLength; i++) { const v = dataArray[i] / 128.0; const y = v * canvas.height / 2; if (i === 0) canvasCtx.moveTo(x, y); else canvasCtx.lineTo(x, y); x += sliceWidth; sum += Math.abs(v - 1); }
+                canvasCtx.lineTo(canvas.width, canvas.height / 2); canvasCtx.stroke();
+                const level = sum / bufferLength; micIndicator.textContent = '麦克风: 已连接' + (level > 0.03 ? ' · 正在说话' : '');
+                // update acoustic features
+                updateAcousticFeatures();
+            }
+            draw();
+        }
+
+        // ===== 声学特征提取（增强版）与情绪判断 =====
+        function getFloatBuffer() {
+            const size = analyser.fftSize;
+            const buf = new Float32Array(size);
+            try { analyser.getFloatTimeDomainData(buf); }
+            catch (e) { const tmp = new Uint8Array(size); analyser.getByteTimeDomainData(tmp); for (let i = 0; i < size; i++) buf[i] = (tmp[i] - 128) / 128; }
+            return buf;
+        }
+
+        function rms(buf) { let s = 0; for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i]; return Math.sqrt(s / buf.length); }
+
+        // 改进的基频检测算法 - 结合自相关与峰值检测
+        function autoCorrelate(buf, sampleRate) {
+            const SIZE = buf.length;
+            let rmsVal = rms(buf);
+            if (rmsVal < 0.01) return -1;
+
+            // 中心裁剪，减少边缘影响
+            const centerBuf = buf.slice(SIZE / 4, SIZE * 3 / 4);
+            const CENTER_SIZE = centerBuf.length;
+
+            let r = new Array(CENTER_SIZE / 2).fill(0);
+            for (let lag = 1; lag < CENTER_SIZE / 2; lag++) {
+                let sum = 0;
+                for (let i = 0; i < CENTER_SIZE - lag; i++) {
+                    sum += centerBuf[i] * centerBuf[i + lag];
+                }
+                r[lag] = sum / (CENTER_SIZE - lag);
+            }
+
+            // 找到自相关峰值
+            let maxval = -1, maxpos = -1;
+            // 在合理的频率范围内搜索（50-500Hz）
+            const minLag = Math.floor(sampleRate / 500);
+            const maxLag = Math.floor(sampleRate / 50);
+
+            for (let i = minLag; i < maxLag; i++) {
+                if (r[i] > maxval && r[i] > r[i - 1] && r[i] > r[i + 1]) {
+                    maxval = r[i];
+                    maxpos = i;
+                }
+            }
+
+            if (maxval <= 0 || maxpos <= 0) return -1;
+
+            // 抛物线插值精化
+            let x1 = r[maxpos - 1], x2 = r[maxpos], x3 = r[maxpos + 1];
+            let a = (x1 + x3 - 2 * x2) / 2;
+            let b = (x3 - x1) / 2;
+            let lag = maxpos;
+            if (a !== 0) lag = maxpos - b / (2 * a);
+
+            const freq = sampleRate / lag;
+            if (freq > 500 || freq < 50) return -1;
+            return freq;
+        }
+
+        // 计算频谱中心（简化版）
+        function getSpectralCentroid(buf, sampleRate) {
+            const SIZE = buf.length;
+            let sum = 0;
+            let magnitudeSum = 0;
+
+            // 使用快速傅里叶变换获取频谱
+            const fft = new Float32Array(SIZE);
+            try {
+                analyser.getFloatFrequencyData(fft);
+            } catch (e) {
+                return 0;
+            }
+
+            for (let i = 0; i < SIZE / 2; i++) {
+                const magnitude = Math.pow(10, fft[i] / 20);
+                const frequency = (i * sampleRate) / SIZE;
+                sum += frequency * magnitude;
+                magnitudeSum += magnitude;
+            }
+
+            if (magnitudeSum === 0) return 0;
+            return sum / magnitudeSum;
+        }
+
+        function updateAcousticFeatures() {
+            if (!analyser) return;
+
+            const sampleRate = (audioCtx && audioCtx.sampleRate) ? audioCtx.sampleRate : 44100;
+            const buf = getFloatBuffer();
+            const curRms = rms(buf);
+            const curPitch = autoCorrelate(buf, sampleRate);
+            const spectralCentroid = getSpectralCentroid(buf, sampleRate);
+            const now = performance.now();
+            const voiced = curRms > 0.015; // 调整语音阈值
+
+            // 更新语音/静音时间
+            if (voiced) voicedTime += 16; else silentTime += 16;
+
+            // 保存特征
+            featureWindow.push({
+                t: now,
+                rms: curRms,
+                pitch: curPitch,
+                voiced: voiced,
+                spectralCentroid: spectralCentroid
+            });
+
+            // 维持窗口大小（可调整为3秒以捕获更多上下文）
+            const windowDuration = 3000;
+            while (featureWindow.length && now - featureWindow[0].t > windowDuration) {
+                featureWindow.shift();
+            }
+
+            const n = featureWindow.length;
+            if (n === 0) return;
+
+            // 计算基础统计特征
+            let avgRms = 0, cntPitch = 0, sumPitch = 0, voicedFrames = 0;
+            let sumSpectralCentroid = 0;
+            let pitchValues = [];
+            let rmsValues = [];
+
+            for (const f of featureWindow) {
+                avgRms += f.rms;
+                rmsValues.push(f.rms);
+                if (f.pitch && f.pitch > 0) {
+                    sumPitch += f.pitch;
+                    cntPitch++;
+                    pitchValues.push(f.pitch);
+                }
+                if (f.voiced) voicedFrames++;
+                sumSpectralCentroid += f.spectralCentroid;
+            }
+
+            avgRms = avgRms / n;
+            const avgPitch = cntPitch ? sumPitch / cntPitch : -1;
+            const voicedFrac = voicedFrames / n;
+            const avgSpectralCentroid = sumSpectralCentroid / n;
+
+            // 计算动态特征
+            let pitchStdDev = 0;
+            if (cntPitch > 1) {
+                const mean = avgPitch;
+                for (const p of pitchValues) {
+                    pitchStdDev += Math.pow(p - mean, 2);
+                }
+                pitchStdDev = Math.sqrt(pitchStdDev / (cntPitch - 1));
+            }
+
+            // 能量变化率
+            let rmsStdDev = 0;
+            if (n > 1) {
+                for (const r of rmsValues) {
+                    rmsStdDev += Math.pow(r - avgRms, 2);
+                }
+                rmsStdDev = Math.sqrt(rmsStdDev / (n - 1));
+            }
+
+            // 计算停顿次数和平均停顿长度
+            // 只有当“有声音，但没有词语”时才判断为停顿
+            let pauseCount = 0;
+            let pauseLengths = [];
+            let currentPause = 0;
+            let hasVoicedSignal = false;
+
+            // 先检查是否有语音信号
+            for (const f of featureWindow) {
+                if (f.voiced) {
+                    hasVoicedSignal = true;
+                    break;
+                }
+            }
+
+            // 只有在有语音信号时才计算停顿
+            if (hasVoicedSignal) {
+                for (const f of featureWindow) {
+                    if (!f.voiced) {
+                        currentPause++;
+                    } else {
+                        if (currentPause > 3) { // 至少4帧静音才视为停顿
+                            pauseCount++;
+                            pauseLengths.push(currentPause * 16); // 转换为毫秒
+                        }
+                        currentPause = 0;
+                    }
+                }
+            }
+
+            const avgPauseLength = pauseLengths.length > 0
+                ? pauseLengths.reduce((a, b) => a + b, 0) / pauseLengths.length
+                : 0;
+
+            // 计算语速
+            // 只有在有语音信号时才更新语速
+            let speakingRate = 0;
+            if (hasVoicedSignal && lastResultTime && lastResultText) {
+                const dt = (now - lastResultTime) / 1000;
+                if (dt > 0) {
+                    speakingRate = lastResultText.replace(/\s+/g, '').length / dt;
+                }
+            }
+
+            // 基于权重的情绪判断算法
+            let audioLabel = '中性', score = 0.6;
+
+            // 计算能量动态变化
+            let rmsChange = 0;
+            if (rmsValues.length > 1) {
+                const firstHalf = rmsValues.slice(0, Math.floor(rmsValues.length / 2));
+                const secondHalf = rmsValues.slice(Math.floor(rmsValues.length / 2));
+                const avgFirst = firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length;
+                const avgSecond = secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length;
+                rmsChange = avgSecond - avgFirst;
+            }
+
+            // 语音活动检测（VAD）：判断当前是否有有效的语音信号
+            // 避免在无语音时误判情绪
+            const VAD_THRESHOLD = 0.015; // 语音活动检测阈值
+            const hasValidSpeech = avgRms > VAD_THRESHOLD && voicedFrac > 0.2;
+
+            // 情绪评分系统
+            const emotionScores = {
+                '激动/愤怒': 0,
+                '高兴/兴奋': 0,
+                '积极/愉悦': 0,
+                '紧张/焦虑': 0,
+                '悲伤/低落': 0,
+                '疲倦/虚弱': 0,
+                '平静/中性': 0
+            };
+
+            // 只有在有有效语音信号时才进行情绪评分
+            if (hasValidSpeech) {
+                // 为每个情绪分配权重
+                // 激动/愤怒特征：高能量、高音调、快语速、高频谱中心
+                emotionScores['激动/愤怒'] += Math.min(1, (avgRms - 0.05) / 0.05) * 0.3; // 能量权重
+                emotionScores['激动/愤怒'] += avgPitch > 200 ? Math.min(1, (avgPitch - 200) / 100) * 0.25 : 0; // 音调权重
+                emotionScores['激动/愤怒'] += speakingRate > 3.0 ? Math.min(1, (speakingRate - 3.0) / 2.0) * 0.2 : 0; // 语速权重
+                emotionScores['激动/愤怒'] += spectralCentroid > 1000 ? Math.min(1, (spectralCentroid - 1000) / 1000) * 0.15 : 0; // 频谱中心权重
+                emotionScores['激动/愤怒'] += rmsChange > 0.01 ? Math.min(1, rmsChange / 0.02) * 0.1 : 0; // 能量上升权重
+
+                // 高兴/兴奋特征：中等能量、高音调、较快语速、高基频变化
+                emotionScores['高兴/兴奋'] += Math.min(1, Math.max(0, (avgRms - 0.03) / 0.03)) * 0.25; // 能量权重
+                emotionScores['高兴/兴奋'] += avgPitch > 180 ? Math.min(1, (avgPitch - 180) / 80) * 0.25 : 0; // 音调权重
+                emotionScores['高兴/兴奋'] += speakingRate > 2.5 ? Math.min(1, (speakingRate - 2.5) / 1.5) * 0.2 : 0; // 语速权重
+                emotionScores['高兴/兴奋'] += pitchStdDev > 20 ? Math.min(1, (pitchStdDev - 20) / 30) * 0.2 : 0; // 基频变化权重
+                emotionScores['高兴/兴奋'] += voicedFrac > 0.6 ? Math.min(1, (voicedFrac - 0.6) / 0.3) * 0.1 : 0; // 语音比例权重
+
+                // 积极/愉悦特征：中等能量、中等音调、正常语速
+                emotionScores['积极/愉悦'] += Math.min(1, Math.max(0, (avgRms - 0.03) / 0.02)) * 0.3; // 能量权重
+                emotionScores['积极/愉悦'] += avgPitch > 150 ? Math.min(1, (avgPitch - 150) / 50) * 0.25 : 0; // 音调权重
+                emotionScores['积极/愉悦'] += speakingRate > 2.0 ? Math.min(1, (speakingRate - 2.0) / 1.0) * 0.25 : 0; // 语速权重
+                emotionScores['积极/愉悦'] += pitchStdDev > 15 ? Math.min(1, (pitchStdDev - 15) / 25) * 0.2 : 0; // 基频变化权重
+
+                // 紧张/焦虑特征：中等能量、高音调、非常快语速、高基频变化
+                emotionScores['紧张/焦虑'] += Math.min(1, Math.max(0, (avgRms - 0.03) / 0.03)) * 0.2; // 能量权重
+                emotionScores['紧张/焦虑'] += avgPitch > 180 ? Math.min(1, (avgPitch - 180) / 100) * 0.2 : 0; // 音调权重
+                emotionScores['紧张/焦虑'] += speakingRate > 3.5 ? Math.min(1, (speakingRate - 3.5) / 2.5) * 0.3 : 0; // 语速权重（高权重）
+                emotionScores['紧张/焦虑'] += pitchStdDev > 30 ? Math.min(1, (pitchStdDev - 30) / 30) * 0.3 : 0; // 基频变化权重（高权重）
+
+                // 悲伤/低落特征：低能量、低音调、慢语速、能量稳定
+                emotionScores['悲伤/低落'] += avgRms < 0.03 ? Math.min(1, (0.03 - avgRms) / 0.02) * 0.4 : 0; // 低能量权重（增加权重）
+                emotionScores['悲伤/低落'] += avgPitch > 0 && avgPitch < 140 ? Math.min(1, (140 - avgPitch) / 40) * 0.35 : 0; // 低音调权重（增加权重）
+                emotionScores['悲伤/低落'] += speakingRate < 2.5 ? Math.min(1, (2.5 - speakingRate) / 1.5) * 0.35 : 0; // 慢语速权重（增加权重）
+                emotionScores['悲伤/低落'] += Math.abs(rmsChange) < 0.005 ? Math.min(1, (0.005 - Math.abs(rmsChange)) / 0.005) * 0.2 : 0; // 能量稳定权重（替代停顿率）
+
+                // 疲倦/虚弱特征：低能量、低音调、低语音比例
+                emotionScores['疲倦/虚弱'] += avgRms < 0.025 ? Math.min(1, (0.025 - avgRms) / 0.015) * 0.35 : 0; // 低能量权重
+                emotionScores['疲倦/虚弱'] += (avgPitch > 0 && avgPitch < 130) || avgPitch === -1 ? 0.3 : 0; // 低音调或无音调权重
+                emotionScores['疲倦/虚弱'] += voicedFrac < 0.5 ? Math.min(1, (0.5 - voicedFrac) / 0.3) * 0.35 : 0; // 低语音比例权重
+
+                // 平静/中性特征：中等能量、稳定音调、中等语速
+                emotionScores['平静/中性'] += Math.abs(avgRms - 0.03) < 0.015 ? 1 - Math.abs(avgRms - 0.03) / 0.015 : 0; // 中等能量权重
+                emotionScores['平静/中性'] += pitchStdDev < 20 ? Math.min(1, (20 - pitchStdDev) / 20) * 0.3 : 0; // 稳定音调权重
+                emotionScores['平静/中性'] += speakingRate > 1.5 && speakingRate < 3.0 ? Math.min(1, (3.0 - Math.abs(speakingRate - 2.25)) / 1.5) * 0.3 : 0; // 中等语速权重
+            } else {
+                // 无有效语音信号，直接将平静/中性的分数设为最高
+                emotionScores['平静/中性'] = 1;
+            }
+
+            // 归一化所有情绪分数
+            let totalScore = 0;
+            for (const emotion in emotionScores) {
+                totalScore += emotionScores[emotion];
+            }
+
+            // 归一化当前帧的情绪分数
+            const currentFrameScores = {};
+            for (const emotion in emotionScores) {
+                currentFrameScores[emotion] = totalScore > 0 ? emotionScores[emotion] / totalScore : 0;
+            }
+
+            // 更新情绪缓冲 - 平滑过渡，实现累积效应
+            for (const emotion in emotionBuffer) {
+                // 应用一阶低通滤波器：新缓冲值 = 旧缓冲值 * (1-alpha) + 当前值 * alpha
+                emotionBuffer[emotion] = emotionBuffer[emotion] * (1 - EMOTION_BUFFER_ALPHA) + currentFrameScores[emotion] * EMOTION_BUFFER_ALPHA;
+            }
+
+            // 找出缓冲后的最高分情绪
+            let maxScore = 0;
+            for (const emotion in emotionBuffer) {
+                if (emotionBuffer[emotion] > maxScore) {
+                    maxScore = emotionBuffer[emotion];
+                    audioLabel = emotion;
+                }
+            }
+
+            // 计算置信度
+            score = 0.5 + maxScore * 0.45; // 置信度范围：0.5-0.95
+
+            // 特殊情况处理：如果所有分数都很低，判断为中性
+            if (maxScore < 0.2) {
+                audioLabel = '平静/中性';
+                score = 0.6;
+                // 重置缓冲到平静状态
+                Object.keys(emotionBuffer).forEach(emo => {
+                    emotionBuffer[emo] = 0;
+                });
+                emotionBuffer['平静/中性'] = 1;
+            }
+
+            // 更新UI
+            if (metricsEl) {
+                metricsEl.textContent = `RMS:${avgRms.toFixed(3)} ⸱ Pitch:${avgPitch > 0 ? Math.round(avgPitch) + 'Hz' : '-'} ⸱ PitchVar:${pitchStdDev.toFixed(0)}Hz ⸱ Voiced:${Math.round(voicedFrac * 100)}% ⸱ Rate:${speakingRate.toFixed(2)} chars/s ⸱ Pauses:${pauseCount}`;
+            }
+
+            if (audioEmoEl) {
+                audioEmoEl.textContent = `${audioLabel}（${Math.round(score * 100)}%）`;
+                audioEmoEl.className = '';
+                if (audioLabel.includes('激') || audioLabel.includes('积极') || audioLabel.includes('高兴') || audioLabel.includes('兴奋')) {
+                    audioEmoEl.classList.add('positive');
+                } else if (audioLabel.includes('低落') || audioLabel.includes('疲') || audioLabel.includes('悲伤') || audioLabel.includes('紧张') || audioLabel.includes('焦虑')) {
+                    audioEmoEl.classList.add('negative');
+                } else {
+                    audioEmoEl.classList.add('neutral');
+                }
+            }
+        }
+
+        // --- Web Speech API ---
+        let recognition, recognizing = false;
+        function startSpeechRecognition() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) { setStatus('浏览器不支持 Web Speech API。请使用手动输入或在支持的浏览器上打开（Chrome Android）。'); return; }
+            recognition = new SpeechRecognition(); recognition.lang = 'zh-CN'; recognition.interimResults = false; recognition.continuous = true;
+            recognition.onstart = () => { recognizing = true; };
+            recognition.onerror = (e) => { console.warn('识别错误', e); };
+            recognition.onend = () => { recognizing = false; setStatus('识别已停止'); };
+            recognition.onresult = (evt) => {
+                const res = evt.results[evt.results.length - 1]; const text = res[0].transcript.trim(); txtEl.textContent = text; setStatus('已识别一段语音'); // update speech-rate helper
+                lastResultTime = performance.now(); lastResultText = text;
+                analyzeEmotion(text).then(renderEmotion).catch(e => { emoEl.textContent = '分析失败：' + e.message; });
+            };
+            recognition.start(); setStatus('语音识别已开始');
+        }
+        function stopSpeechRecognition() { if (recognition && recognizing) recognition.stop(); }
+
+        function renderEmotion(result) {
+            console.log('renderEmotion result=', result);
+            if (!result) { emoEl.textContent = '（无结果）'; emoEl.className = 'neutral'; return; }
+            const label = result.label || result.sentiment || '中性';
+            let score = typeof result.score === 'number' ? result.score : (result.confidence || 0.6);
+            if (score > 1) score = Math.min(1, score / 100);
+            emoEl.textContent = `${label}（置信度 ${Math.round(score * 100)}%）`;
+            emoEl.className = ''; if (label === '积极' || label === '2' || label === 'positive') emoEl.classList.add('positive'); else if (label === '消极' || label === '1' || label === 'negative') emoEl.classList.add('negative'); else emoEl.classList.add('neutral');
+        }
+
+        function localEmotionAnalysis(text) {
+            // 扩展的情绪词典 - 包含更多常用情绪词汇
+            const emotionDict = {
+                positive: {
+                    strong: ['非常高兴', '特别开心', '极其愉快', '超级喜欢', '十分满意', '非常快乐', '太棒了', '非常好', '完美', '极好', '太棒', '超棒', '好极了', '高兴极了', '开心极了'],
+                    medium: ['高兴', '开心', '愉快', '喜欢', '满意', '快乐', '棒', '不错', '好', '优秀', '精彩', '兴奋', '愉悦', '幸福', '喜悦', '舒畅', '惬意', '满足', '欣慰'],
+                    weak: ['还可以', '还行', '一般般好', '凑合', '说得过去', '不错', '挺好', '还好', '还不错', '可以']
+                },
+                negative: {
+                    strong: ['非常生气', '特别愤怒', '极其难过', '超级悲伤', '十分失望', '非常讨厌', '极其郁闷', '太糟糕了', '非常难受', '无法忍受', '气死了', '烦死了', '难受死了', '伤心死了', '糟透了'],
+                    medium: ['生气', '愤怒', '难过', '悲伤', '失望', '讨厌', '郁闷', '不行', '糟糕', '难受', '痛苦', '烦躁', '焦虑', '沮丧', '伤心', '悲痛', '烦恼', '懊恼', '悔恨'],
+                    weak: ['不太好', '有点失望', '有点生气', '不太满意', '有点难受', '不太开心', '不开心', '不高兴', '不舒服', '不太舒服', '有点烦']
+                }
+            };
+
+            let score = 0;
+            if (!text || typeof text !== 'string' || text.trim().length === 0) return { label: '中性', score: 0.6 };
+
+            const t = text.trim();
+            const tl = t.toLowerCase();
+
+            // 1. 先检查是否包含独立的否定词，用于后续情绪词的权重调整
+            // 使用正则表达式确保否定词是独立的词，而不是其他词的一部分
+            const negations = ['不', '没', '无', '非', '否', '别', '未'];
+            let hasNegation = false;
+            // 构建正则表达式，匹配独立的否定词
+            const negationRegex = new RegExp(`\\b(${negations.join('|')})\\b`, 'g');
+            hasNegation = negationRegex.test(t);
+
+            // 2. 情绪词匹配 - 使用更精确的匹配方式
+            // 按词长降序排序，优先匹配更长的情绪词
+            const allEmotionWords = [];
+
+            // 添加所有积极词汇
+            for (const [strength, words] of Object.entries(emotionDict.positive)) {
+                for (const word of words) {
+                    allEmotionWords.push({ word, type: 'positive', strength });
+                }
+            }
+
+            // 添加所有消极词汇
+            for (const [strength, words] of Object.entries(emotionDict.negative)) {
+                for (const word of words) {
+                    allEmotionWords.push({ word, type: 'negative', strength });
+                }
+            }
+
+            // 按词长降序排序
+            allEmotionWords.sort((a, b) => b.word.length - a.word.length);
+
+            // 标记已匹配的位置，避免重复匹配
+            const matchedPositions = new Set();
+
+            // 3. 执行情绪词匹配
+            for (const { word, type, strength } of allEmotionWords) {
+                let index = t.indexOf(word);
+                while (index !== -1) {
+                    // 检查是否已匹配过该位置
+                    let isOverlapping = false;
+                    for (let i = index; i < index + word.length; i++) {
+                        if (matchedPositions.has(i)) {
+                            isOverlapping = true;
+                            break;
+                        }
+                    }
+
+                    if (!isOverlapping) {
+                        // 标记为已匹配
+                        for (let i = index; i < index + word.length; i++) {
+                            matchedPositions.add(i);
+                        }
+
+                        // 根据情绪类型和强度添加分数
+                        let wordScore = 0;
+                        switch (strength) {
+                            case 'strong': wordScore = type === 'positive' ? 2 : -2; break;
+                            case 'medium': wordScore = type === 'positive' ? 1 : -1; break;
+                            case 'weak': wordScore = type === 'positive' ? 0.5 : -0.5; break;
+                        }
+
+                        // 检查情绪词附近是否有独立的否定词（3个字以内）
+                        let isNegated = false;
+                        if (hasNegation) {
+                            // 提取情绪词前后的上下文（前后3个字符）
+                            const contextStart = Math.max(0, index - 3);
+                            const contextEnd = Math.min(t.length, index + word.length + 3);
+                            const context = t.substring(contextStart, contextEnd);
+
+                            // 检查上下文中是否有独立的否定词
+                            const contextNegationRegex = new RegExp(`\\b(${negations.join('|')})\\b`, 'g');
+                            isNegated = contextNegationRegex.test(context);
+                        }
+
+                        // 如果被否定，反转分数，但减弱程度
+                        if (isNegated) {
+                            score += wordScore * -0.7;
+                        } else {
+                            score += wordScore;
+                        }
+                    }
+
+                    // 寻找下一个匹配位置
+                    index = t.indexOf(word, index + 1);
+                }
+            }
+
+            // 4. 计算置信度
+            let confidence = 0.6;
+            if (Math.abs(score) > 3) {
+                confidence = Math.min(0.95, 0.6 + Math.abs(score) * 0.08);
+            } else if (Math.abs(score) > 1) {
+                confidence = Math.min(0.85, 0.6 + Math.abs(score) * 0.1);
+            } else if (Math.abs(score) > 0) {
+                confidence = 0.65;
+            }
+
+            // 5. 确定最终标签
+            let label = '中性';
+            if (score > 1) {
+                label = '积极';
+            } else if (score < -1) {
+                label = '消极';
+            }
+
+            return { label: label, score: confidence };
+        }
+
+        async function baiduEmotionAnalysis(text) {
+            if (!CONFIG.baiduApiKey || !CONFIG.baiduSecretKey) throw new Error('百度密钥未配置');
+            const tokenUrl = `https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=${encodeURIComponent(CONFIG.baiduApiKey)}&client_secret=${encodeURIComponent(CONFIG.baiduSecretKey)}`;
+            const tokenRes = await fetch(tokenUrl, { method: 'POST' }); const tokenJson = await tokenRes.json(); if (!tokenJson.access_token) throw new Error('无法获取百度 token');
+            const apiUrl = `https://aip.baidubce.com/rpc/2.0/nlp/v1/sentiment_classify?access_token=${tokenJson.access_token}`;
+            const res = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }); const j = await res.json(); if (j.error_code) throw new Error(j.error_msg || '百度接口错误'); const item = j.items && j.items[0]; if (!item) throw new Error('百度返回格式异常'); const mapping = { '2': '积极', '1': '消极', '0': '中性' }; return { label: mapping[String(item.sentiment)] || '中性', score: item.confidence || Math.max(item.positive_prob || 0, item.negative_prob || 0) || 0.6 };
+        }
+
+        async function proxyEmotionAnalysis(text) {
+            try {
+                const url = CONFIG.proxyUrl || '/api/sentiment';
+                const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+                const j = await resp.json(); if (!j.ok) throw new Error(JSON.stringify(j.error || j)); const apiData = j.data; const item = apiData.items && apiData.items[0]; if (!item) return { label: '中性', score: 0.6 };
+                const mapping = { '2': '积极', '1': '消极', '0': '中性' };
+                return { label: mapping[String(item.sentiment)] || '中性', score: item.confidence || Math.max(item.positive_prob || 0, item.negative_prob || 0) || 0.6 };
+            } catch (e) { console.warn('proxyEmotionAnalysis error', e); throw e; }
+        }
+
+        // 大模型情绪分析函数
+        async function llmEmotionAnalysis(text) {
+            if (!CONFIG.llmApiKey) throw new Error('大模型API Key未配置');
+
+            let apiUrl, headers, body;
+            const model = CONFIG.llmModel || 'gpt-3.5-turbo';
+
+            // 构建大模型请求
+            const prompt = `请分析以下文本的情绪，仅返回"积极"、"消极"或"中性"，不要返回任何其他内容：
+
+${text}`;
+
+            // 根据不同大模型类型构建请求
+            switch (CONFIG.llmType) {
+                case 'openai':
+                    apiUrl = CONFIG.llmApiUrl || 'https://api.openai.com/v1/chat/completions';
+                    headers = {
+                        'Authorization': `Bearer ${CONFIG.llmApiKey}`,
+                        'Content-Type': 'application/json'
+                    };
+                    body = JSON.stringify({
+                        model: model,
+                        messages: [
+                            { role: 'system', content: '你是一个情绪分析专家，擅长分析文本的情绪。' },
+                            { role: 'user', content: prompt }
+                        ],
+                        max_tokens: 10,
+                        temperature: 0
+                    });
+                    break;
+
+                case 'gemini':
+                    apiUrl = CONFIG.llmApiUrl || 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.0-pro:generateContent';
+                    headers = {
+                        'Authorization': `Bearer ${CONFIG.llmApiKey}`,
+                        'Content-Type': 'application/json'
+                    };
+                    body = JSON.stringify({
+                        contents: [
+                            {
+                                parts: [
+                                    { text: prompt }
+                                ]
+                            }
+                        ]
+                    });
+                    break;
+
+                case 'claude':
+                    apiUrl = CONFIG.llmApiUrl || 'https://api.anthropic.com/v1/messages';
+                    headers = {
+                        'x-api-key': CONFIG.llmApiKey,
+                        'Content-Type': 'application/json',
+                        'anthropic-version': '2023-06-01'
+                    };
+                    body = JSON.stringify({
+                        model: model,
+                        messages: [
+                            { role: 'user', content: prompt }
+                        ],
+                        max_tokens: 10,
+                        temperature: 0
+                    });
+                    break;
+
+                case 'custom':
+                    if (!CONFIG.llmApiUrl) throw new Error('自定义大模型需要配置API地址');
+                    apiUrl = CONFIG.llmApiUrl;
+                    headers = {
+                        'Authorization': `Bearer ${CONFIG.llmApiKey}`,
+                        'Content-Type': 'application/json'
+                    };
+                    body = JSON.stringify({
+                        model: model,
+                        prompt: prompt,
+                        max_tokens: 10,
+                        temperature: 0
+                    });
+                    break;
+
+                default:
+                    throw new Error('不支持的大模型类型');
+            }
+
+            // 发送请求
+            const res = await fetch(apiUrl, {
+                method: 'POST',
+                headers: headers,
+                body: body
+            });
+
+            if (!res.ok) {
+                throw new Error(`大模型API请求失败：${res.status} ${res.statusText}`);
+            }
+
+            const j = await res.json();
+
+            // 解析不同大模型的响应
+            let emotionLabel = '中性';
+
+            switch (CONFIG.llmType) {
+                case 'openai':
+                    emotionLabel = j.choices[0].message.content.trim();
+                    break;
+
+                case 'gemini':
+                    emotionLabel = j.candidates[0].content.parts[0].text.trim();
+                    break;
+
+                case 'claude':
+                    emotionLabel = j.content[0].text.trim();
+                    break;
+
+                case 'custom':
+                    // 自定义模型默认解析
+                    emotionLabel = j.text || j.content || '中性';
+                    emotionLabel = emotionLabel.trim();
+                    break;
+            }
+
+            // 标准化情绪标签
+            const normalizedLabel = {
+                '积极': '积极',
+                'positive': '积极',
+                '消极': '消极',
+                'negative': '消极',
+                '中性': '中性',
+                'neutral': '中性'
+            }[emotionLabel] || '中性';
+
+            // 返回结果
+            return {
+                label: normalizedLabel,
+                score: 0.9 // 大模型情绪判断置信度默认设置为0.9
+            };
+        }
+
+        async function analyzeEmotion(text) {
+            if (CONFIG.apiType === 'baidu') {
+                try { return await baiduEmotionAnalysis(text); }
+                catch (e) { console.warn('Baidu 分析失败，回退本地：', e); return localEmotionAnalysis(text); }
+            }
+            if (CONFIG.apiType === 'proxy') {
+                try { return await proxyEmotionAnalysis(text); }
+                catch (e) { console.warn('Proxy 分析失败，回退本地：', e); return localEmotionAnalysis(text); }
+            }
+            if (CONFIG.apiType === 'llm') {
+                try { return await llmEmotionAnalysis(text); }
+                catch (e) { console.warn('大模型分析失败，回退本地：', e); return localEmotionAnalysis(text); }
+            }
+            return localEmotionAnalysis(text);
+        }
+
+        btnStart.addEventListener('click', () => startAudio());
+        btnStop.addEventListener('click', () => stopAudio());
+        btnAnalyze.addEventListener('click', () => { const t = manualText.value.trim(); if (!t) { alert('请输入文本'); return; } txtEl.textContent = t; analyzeEmotion(t).then(renderEmotion).catch(e => { emoEl.textContent = '分析失败：' + e.message; }); });
+
+        // ===== 设置对话框（动态创建，避免额外文件） =====
+        function openSettings() {
+            const modal = document.createElement('div');
+            modal.style.position = 'fixed'; modal.style.left = 0; modal.style.top = 0; modal.style.right = 0; modal.style.bottom = 0;
+            modal.style.background = 'rgba(0,0,0,0.4)'; modal.style.display = 'flex'; modal.style.alignItems = 'center'; modal.style.justifyContent = 'center';
+            const box = document.createElement('div'); box.style.background = '#fff'; box.style.padding = '12px'; box.style.borderRadius = '8px'; box.style.width = '92%'; box.style.maxWidth = '520px';
+            box.innerHTML = `
+      <h3 style="margin:0 0 8px 0">设置</h3>
+      <div style="margin-bottom:8px">模式：
+        <select id="cfg_apiType">
+          <option value="local">local（本地关键词）</option>
+          <option value="proxy">proxy（后端代理）</option>
+          <option value="baidu">baidu（前端直连）</option>
+          <option value="llm">llm（大模型辅助）</option>
+        </select>
+      </div>
+      <div style="margin-bottom:8px">代理 URL：<input id="cfg_proxyUrl" style="width:100%"/></div>
+      <div style="margin-bottom:8px">百度 API Key：<input id="cfg_baiduApiKey" style="width:100%"/></div>
+      <div style="margin-bottom:8px">百度 Secret Key：<input id="cfg_baiduSecretKey" style="width:100%"/></div>
+      
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid #eee">
+        <h4 style="margin:0 0 8px 0">大模型配置</h4>
+        <div style="margin-bottom:8px">大模型类型：
+          <select id="cfg_llmType">
+            <option value="openai">OpenAI</option>
+            <option value="gemini">Gemini</option>
+            <option value="claude">Claude</option>
+            <option value="custom">自定义</option>
+          </select>
+        </div>
+        <div style="margin-bottom:8px">API Key：<input id="cfg_llmApiKey" style="width:100%" placeholder="大模型API密钥"/></div>
+        <div style="margin-bottom:8px">模型型号：<input id="cfg_llmModel" style="width:100%" placeholder="如：gpt-3.5-turbo"/></div>
+        <div style="margin-bottom:8px">自定义API地址（可选）：<input id="cfg_llmApiUrl" style="width:100%" placeholder="如：https://api.openai.com/v1/chat/completions"/></div>
+      </div>
+      
+      <div style="text-align:right;margin-top:8px"><button id="cfg_save">保存</button> <button id="cfg_close">关闭</button></div>
+    `;
+            modal.appendChild(box); document.body.appendChild(modal);
+            const sel = box.querySelector('#cfg_apiType');
+            const inProxy = box.querySelector('#cfg_proxyUrl');
+            const inKey = box.querySelector('#cfg_baiduApiKey');
+            const inSecret = box.querySelector('#cfg_baiduSecretKey');
+            // 大模型配置字段
+            const inLlmType = box.querySelector('#cfg_llmType');
+            const inLlmApiKey = box.querySelector('#cfg_llmApiKey');
+            const inLlmModel = box.querySelector('#cfg_llmModel');
+            const inLlmApiUrl = box.querySelector('#cfg_llmApiUrl');
+
+            // 设置初始值
+            sel.value = CONFIG.apiType || DEFAULT_CONFIG.apiType;
+            inProxy.value = CONFIG.proxyUrl || DEFAULT_CONFIG.proxyUrl;
+            inKey.value = CONFIG.baiduApiKey || '';
+            inSecret.value = CONFIG.baiduSecretKey || '';
+            inLlmType.value = CONFIG.llmType || DEFAULT_CONFIG.llmType;
+            inLlmApiKey.value = CONFIG.llmApiKey || '';
+            inLlmModel.value = CONFIG.llmModel || DEFAULT_CONFIG.llmModel;
+            inLlmApiUrl.value = CONFIG.llmApiUrl || '';
+
+            box.querySelector('#cfg_close').addEventListener('click', () => { document.body.removeChild(modal); });
+            box.querySelector('#cfg_save').addEventListener('click', () => {
+                CONFIG.apiType = sel.value;
+                CONFIG.proxyUrl = inProxy.value.trim();
+                CONFIG.baiduApiKey = inKey.value.trim();
+                CONFIG.baiduSecretKey = inSecret.value.trim();
+                // 保存大模型配置
+                CONFIG.llmType = inLlmType.value;
+                CONFIG.llmApiKey = inLlmApiKey.value.trim();
+                CONFIG.llmModel = inLlmModel.value.trim();
+                CONFIG.llmApiUrl = inLlmApiUrl.value.trim();
+                saveConfig();
+                alert('已保存设置');
+                document.body.removeChild(modal);
+            });
+        }
+
+        btnSettings.addEventListener('click', openSettings);
+
+        // 测试代理按钮
+        async function testProxy() {
+            const url = CONFIG.proxyUrl || '/api/sentiment';
+            try {
+                const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: '测试' }) });
+                const j = await resp.json();
+                alert('代理响应：' + JSON.stringify(j));
+            } catch (e) { alert('测试代理失败：' + e.message); }
+        }
+        btnTestProxy.addEventListener('click', testProxy);
+
+        // 提示：移动端使用建议（简短）
+        console.log('移动端说明：若浏览器不支持语音识别，请使用手动输入。保证麦克风权限与 HTTPS/localhost。设置已保存到浏览器本地。');
+    </script>
+</body>
+
+</html>
